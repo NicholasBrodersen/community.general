@@ -1,0 +1,23 @@
+# Copyright (c) 2026, Nicholas Brodersen <nicholasbrodersen01@gmail.com>
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+---
+- name: Get RPM's own matches for the selector
+  ansible.builtin.command:
+    argv: [rpm, --query, --all, --queryformat, '%{NVRA}\n', "name={{ rpm_info_pattern }}"]
+  environment:
+    LC_ALL: C
+  register: rpm_info_native
+  changed_when: false
+
+- name: Query the same selector through the module
+  community.general.rpm_info:
+    name: ["{{ rpm_info_pattern }}"]
+    include: [metadata]
+  register: rpm_info_matching
+
+- name: Check native selector results are preserved
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_matching.changed
+      - rpm_info_matching.packages | map(attribute='nvra') | sort | list == rpm_info_native.stdout_lines | sort

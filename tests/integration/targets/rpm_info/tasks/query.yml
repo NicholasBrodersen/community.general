@@ -1,0 +1,124 @@
+# Copyright (c) 2026, Nicholas Brodersen <nicholasbrodersen01@gmail.com>
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+---
+- name: Query an exact package name
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}"]
+  register: rpm_info_default
+
+- name: Check defaults and installed versions
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_default.changed
+      - rpm_info_default.packages | length == 2
+      - rpm_info_default.packages | map(attribute='version') | list == ['1.0', '2.0']
+      - rpm_info_default.packages[0].arch == 'noarch'
+      - rpm_info_default.packages[0].epoch is none
+      - rpm_info_default.packages[0].description is search('<tag> & "quotes"')
+      - rpm_info_default.packages[0].description is search('multiple lines')
+      - rpm_info_default.packages[0].requirename is contains('ansible-rpm-info-intentionally-unavailable')
+      - rpm_info_default.packages[0].postin is search('script-executed')
+      - rpm_info_default.packages[0].changelogtext is not defined
+      - rpm_info_default.packages[0].verify is not defined
+
+- name: Query overlapping selectors in reverse order
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}*", "{{ rpm_info_package }}", "{{ rpm_info_package }}*"]
+    include: [metadata]
+  register: rpm_info_overlap
+
+- name: Assert deduplication and deterministic output
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_overlap.changed
+      - rpm_info_overlap.packages | map(attribute='name') | list == [rpm_info_package, rpm_info_package, rpm_info_package ~ '-empty']
+      - rpm_info_overlap.packages | map(attribute='version') | list == ['1.0', '2.0', '1.0']
+      - rpm_info_overlap.packages[0].filenames is not defined
+
+- name: Compare native selectors with RPM directly
+  ansible.builtin.include_tasks: native_pattern.yml
+  loop:
+    - "{{ rpm_info_package }}*"
+    - "{{ rpm_info_package }}[.-]*"
+    - "{{ rpm_info_package }}?"
+    - "{{ rpm_info_package }}-absent*"
+  loop_control:
+    loop_var: rpm_info_pattern
+
+- name: Query every section independently
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}"]
+    include: ["{{ item }}"]
+  loop: [metadata, files, dependencies, scripts, triggers, signatures, changelog]
+  register: rpm_info_sections
+
+- name: Check every section returns both versions successfully
+  ansible.builtin.assert:
+    that:
+      - not item.changed
+      - item.packages | length == 2
+      - item.packages[0].name == rpm_info_package
+      - (item.packages[0].version is defined) == (item.item == 'metadata')
+  loop: "{{ rpm_info_sections.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Query all sections in check mode
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}"]
+    include: [all]
+  check_mode: true
+  register: rpm_info_all
+
+- name: Check changelog array and read-only behavior
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_all.changed
+      - rpm_info_all.packages[0].changelogtext == ['- Build the local integration fixture.']
+      - rpm_info_all.packages[0].filenames is contains(rpm_info_workspace.path ~ '/payload/1.0/with spaces.txt')
+
+- name: Query without any output sections
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}"]
+    include: []
+  register: rpm_info_names
+
+- name: Check only names are exposed
+  ansible.builtin.assert:
+    that:
+      - "rpm_info_names.packages == [{'name': rpm_info_package}, {'name': rpm_info_package}]"
+
+- name: Query an absent package
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}-absent"]
+  register: rpm_info_absent
+
+- name: Check no matches are successful
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_absent.changed
+      - rpm_info_absent.packages == []
+
+- name: Query a malformed native selector
+  community.general.rpm_info:
+    name: ['[']
+  register: rpm_info_invalid
+  ignore_errors: true
+
+- name: Check malformed selectors fail explicitly
+  ansible.builtin.assert:
+    that:
+      - rpm_info_invalid is failed
+      - rpm_info_invalid.msg == 'Failed to query installed RPM packages'
+
+- name: Repeat a query to check idempotence
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}"]
+  register: rpm_info_repeat
+
+- name: Check repeated results match
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_repeat.changed
+      - rpm_info_repeat.packages == rpm_info_default.packages

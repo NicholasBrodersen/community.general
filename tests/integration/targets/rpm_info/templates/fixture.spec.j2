@@ -1,0 +1,58 @@
+# Copyright (c) 2026, Nicholas Brodersen <nicholasbrodersen01@gmail.com>
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+%global __os_install_post %{nil}
+%global _build_id_links none
+%global _binary_payload w9.gzdio
+%global _binary_filedigest_algorithm 8
+%global payload {{ rpm_info_workspace.path }}/payload/%{version}
+
+Name: {{ rpm_info_package }}
+Version: {{ item }}
+Release: 1
+Summary: RPM information test fixture
+License: GPL-3.0-or-later
+BuildArch: noarch
+AutoReqProv: no
+Requires: ansible-rpm-info-intentionally-unavailable
+Provides: ansible-rpm-info-fixture = %{version}
+
+%description
+A package with XML characters: <tag> & "quotes".
+The description has multiple lines.
+
+%package empty
+Summary: Empty RPM information test fixture
+AutoReqProv: no
+
+%description empty
+A package without installed files.
+
+%install
+mkdir -p "%{buildroot}%{payload}"
+printf 'original content\n' > "%{buildroot}%{payload}/content.txt"
+printf 'keep this file\n' > "%{buildroot}%{payload}/with spaces.txt"
+printf 'setting=true\n' > "%{buildroot}%{payload}/config.ini"
+ln -s content.txt "%{buildroot}%{payload}/link"
+chmod 0644 "%{buildroot}%{payload}/content.txt" "%{buildroot}%{payload}/with spaces.txt" "%{buildroot}%{payload}/config.ini"
+
+%post
+touch "{{ rpm_info_workspace.path }}/script-executed"
+
+%verifyscript
+touch "{{ rpm_info_workspace.path }}/script-executed"
+
+%files
+%defattr(-,root,root,-)
+%dir %{payload}
+%{payload}/content.txt
+"%{payload}/with spaces.txt"
+%config %{payload}/config.ini
+%{payload}/link
+
+%files empty
+
+%changelog
+* Fri Sep 25 2026 RPM info tests <tests@example.invalid> - %{version}-1
+- Build the local integration fixture.

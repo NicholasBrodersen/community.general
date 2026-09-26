@@ -1,0 +1,84 @@
+# Copyright (c) 2026, Nicholas Brodersen <nicholasbrodersen01@gmail.com>
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+---
+- name: Run RPM tests on supported Linux families
+  when: ansible_facts.os_family in ['RedHat', 'Debian']
+  block:
+    - name: Install the RPM build tools
+      ansible.builtin.package:
+        name: "{{ 'rpm-build' if ansible_facts.os_family == 'RedHat' else 'rpm' }}"
+        state: present
+      tags: [rpm_info_dependencies]
+
+    - name: Create the fixture workspace
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: ansible-rpm-info-
+      register: rpm_info_workspace
+
+    - name: Choose a unique fixture package name
+      ansible.builtin.set_fact:
+        rpm_info_package: "ansible-test-rpm-info-{{ rpm_info_workspace.path | basename | replace('_', '-') }}"
+
+    - name: Build and exercise fixture packages
+      block:
+        - name: Create RPM build directories
+          ansible.builtin.file:
+            path: "{{ rpm_info_workspace.path }}/{{ item }}"
+            state: directory
+            mode: '0755'
+          loop: [BUILD, BUILDROOT, RPMS, SOURCES, SPECS, SRPMS, payload]
+
+        - name: Write RPM specs for two installed versions
+          ansible.builtin.template:
+            src: fixture.spec.j2
+            dest: "{{ rpm_info_workspace.path }}/SPECS/fixture-{{ item }}.spec"
+            mode: '0644'
+          loop: ['1.0', '2.0']
+
+        - name: Build the test RPMs
+          ansible.builtin.command:
+            argv:
+              - rpmbuild
+              - --define
+              - "_topdir {{ rpm_info_workspace.path }}"
+              - -bb
+              - "{{ rpm_info_workspace.path }}/SPECS/fixture-{{ item }}.spec"
+          loop: ['1.0', '2.0']
+
+        - name: Install both versions and the empty package without scripts or dependencies
+          ansible.builtin.command:
+            argv:
+              - rpm
+              - --install
+              - --nodeps
+              - --noscripts
+              - "{{ rpm_info_workspace.path }}/RPMS/noarch/{{ item }}.rpm"
+          loop:
+            - "{{ rpm_info_package }}-1.0-1.noarch"
+            - "{{ rpm_info_package }}-2.0-1.noarch"
+            - "{{ rpm_info_package }}-empty-1.0-1.noarch"
+
+        - name: Test queries and output selection
+          ansible.builtin.include_tasks: query.yml
+
+        - name: Test installed-file verification
+          ansible.builtin.include_tasks: verify.yml
+
+      always:
+        - name: Find any fixture packages left after a failure
+          ansible.builtin.command:
+            argv: [rpm, --query, --all, --queryformat, '%{NAME}\n', "name={{ rpm_info_package }}*"]
+          register: rpm_info_remaining
+          changed_when: false
+
+        - name: Remove the installed fixture packages
+          ansible.builtin.command:
+            argv: [rpm, --erase, --allmatches, --nodeps, --noscripts, "{{ item }}"]
+          loop: "{{ rpm_info_remaining.stdout_lines | unique | list }}"
+
+        - name: Remove the fixture workspace
+          ansible.builtin.file:
+            path: "{{ rpm_info_workspace.path }}"
+            state: absent

@@ -1,0 +1,113 @@
+# Copyright (c) 2026, Nicholas Brodersen <nicholasbrodersen01@gmail.com>
+# GNU General Public License v3.0+ (see LICENSES/GPL-3.0-or-later.txt or https://www.gnu.org/licenses/gpl-3.0.txt)
+# SPDX-License-Identifier: GPL-3.0-or-later
+---
+- name: Verify clean packages, including a package without files
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}*"]
+    include: [metadata]
+    verify: true
+  register: rpm_info_clean
+
+- name: Check clean verification and hidden internal file fields
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_clean.changed
+      - item.verify.passed
+      - item.verify.files == []
+      - item.filenames is not defined
+  loop: "{{ rpm_info_clean.packages }}"
+  loop_control:
+    label: "{{ item.nvra }}"
+
+- name: Change file content and permissions in one installed version
+  ansible.builtin.copy:
+    dest: "{{ rpm_info_workspace.path }}/payload/1.0/content.txt"
+    content: "a deliberately different and much longer file\n"
+    mode: '0600'
+
+- name: Set a known modification time
+  ansible.builtin.file:
+    path: "{{ rpm_info_workspace.path }}/payload/1.0/content.txt"
+    modification_time: '200001010000.00'
+  environment:
+    TZ: UTC
+
+- name: Remove a filename containing spaces
+  ansible.builtin.file:
+    path: "{{ rpm_info_workspace.path }}/payload/1.0/with spaces.txt"
+    state: absent
+
+- name: Remove a configuration file
+  ansible.builtin.file:
+    path: "{{ rpm_info_workspace.path }}/payload/1.0/config.ini"
+    state: absent
+
+- name: Change the symlink target
+  ansible.builtin.file:
+    path: "{{ rpm_info_workspace.path }}/payload/1.0/link"
+    src: different-target
+    state: link
+    force: true
+    follow: false
+
+- name: Verify modified files in check mode
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}"]
+    include: [metadata]
+    verify: true
+  check_mode: true
+  register: rpm_info_dirty
+
+- name: Check verification differences do not change or fail the module
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_dirty.changed
+      - not rpm_info_dirty.packages[0].verify.passed
+      - rpm_info_dirty.packages[1].verify.passed
+      - rpm_info_dirty.packages[1].verify.files == []
+
+- name: Index verification results by path
+  ansible.builtin.set_fact:
+    rpm_info_failures: "{{ dict(rpm_info_dirty.packages[0].verify.files | map(attribute='path') | zip(rpm_info_dirty.packages[0].verify.files)) }}"
+    rpm_info_payload: "{{ rpm_info_workspace.path }}/payload/1.0"
+
+- name: Check structured file differences
+  ansible.builtin.assert:
+    that:
+      - rpm_info_failures[rpm_info_payload ~ '/content.txt'].failures.size.actual == 46
+      - rpm_info_failures[rpm_info_payload ~ '/content.txt'].failures.size.expected == 17
+      - rpm_info_failures[rpm_info_payload ~ '/content.txt'].failures.mode.actual.permissions == '0600'
+      - rpm_info_failures[rpm_info_payload ~ '/content.txt'].failures.mode.expected.permissions == '0644'
+      - rpm_info_failures[rpm_info_payload ~ '/content.txt'].failures.digest.algorithm.name == 'sha256'
+      - rpm_info_failures[rpm_info_payload ~ '/content.txt'].failures.digest.actual == ('a deliberately different and much longer file\n' | hash('sha256'))
+      - rpm_info_failures[rpm_info_payload ~ '/content.txt'].failures.mtime.actual.epoch == 946684800
+      - rpm_info_failures[rpm_info_payload ~ '/content.txt'].failures.mtime.actual.iso == '2000-01-01T00:00:00+00:00'
+      - not rpm_info_failures[rpm_info_payload ~ '/with spaces.txt'].failures.exists.actual
+      - rpm_info_failures[rpm_info_payload ~ '/config.ini'].attribute.name == 'configuration'
+      - not rpm_info_failures[rpm_info_payload ~ '/config.ini'].failures.exists.actual
+      - rpm_info_failures[rpm_info_payload ~ '/link'].failures.link_target.expected == 'content.txt'
+      - rpm_info_failures[rpm_info_payload ~ '/link'].failures.link_target.actual == 'different-target'
+
+- name: Verify with no output sections
+  community.general.rpm_info:
+    name: ["{{ rpm_info_package }}"]
+    include: []
+    verify: true
+  register: rpm_info_verify_only
+
+- name: Check verification survives output filtering
+  ansible.builtin.assert:
+    that:
+      - rpm_info_verify_only.packages[0].keys() | sort == ['name', 'verify']
+      - rpm_info_verify_only.packages[0].verify == rpm_info_dirty.packages[0].verify
+
+- name: Check that package scripts have never executed
+  ansible.builtin.stat:
+    path: "{{ rpm_info_workspace.path }}/script-executed"
+  register: rpm_info_script
+
+- name: Assert scripts were skipped
+  ansible.builtin.assert:
+    that:
+      - not rpm_info_script.stat.exists
