@@ -12,13 +12,100 @@ import pwd
 import stat
 import typing as t
 import xml.etree.ElementTree as ET
+from enum import Flag, auto
 from functools import partial
 
 from ansible.module_utils.basic import AnsibleModule
 
 
+class RPMFile(t.NamedTuple):
+    """Expected RPM metadata for one installed path"""
+
+    path: str
+    size: int
+    mode: int
+    device: int
+    mtime: int
+    digest: str
+    link_target: str
+    user: str
+    group: str
+    capabilities: str
+
+
+class VerificationFailure(Flag):
+    """
+    RPM verification outcomes
+    *_UNAVAILABLE means the check returned '?'
+    """
+    NONE = 0
+    MISSING = auto()
+    SIZE_MISMATCH = auto()
+    SIZE_UNAVAILABLE = auto()
+    MODE_MISMATCH = auto()
+    MODE_UNAVAILABLE = auto()
+    DIGEST_MISMATCH = auto()
+    DIGEST_UNAVAILABLE = auto()
+    DEVICE_MISMATCH = auto()
+    DEVICE_UNAVAILABLE = auto()
+    LINK_TARGET_MISMATCH = auto()
+    LINK_TARGET_UNAVAILABLE = auto()
+    USER_MISMATCH = auto()
+    USER_UNAVAILABLE = auto()
+    GROUP_MISMATCH = auto()
+    GROUP_UNAVAILABLE = auto()
+    MTIME_MISMATCH = auto()
+    MTIME_UNAVAILABLE = auto()
+    CAPABILITIES_MISMATCH = auto()
+    CAPABILITIES_UNAVAILABLE = auto()
+
+
+class VerificationRecord:
+    """Parse '<result> [<attribute>] <absolute filename> [<messages>]' into named fields"""
+    path: str
+    result: str
+    flags: VerificationFailure
+    attribute: t.Optional[dict[str, str]]
+    message: t.Optional[str]
+
+    def __init__(self, line: str, known_paths: t.Collection[str]) -> None:
+        # Read the status and optional attribute without splitting the filename.
+        try:
+            result, remaining_text = line.split(maxsplit=1)
+            attribute_code = None
+            if not remaining_text.startswith("/"):
+                attribute_code, remaining_text = remaining_text.split(maxsplit=1)
+        except ValueError as exc:
+            raise ValueError(f"Unrecognized RPM verification record: {line}") from exc
+
+        if not remaining_text.startswith("/"):
+            raise ValueError(f"RPM verification filename must be absolute: {line}")
+
+        flags = RPM_SCHEMA.parse_verification_flags(result)
+        attribute = RPM_SCHEMA.file_attribute(attribute_code)
+
+        # Match the entire filename first: '/file (backup)' may be a real filename.
+        candidate_path = remaining_text
+        messages: list[str] = []
+        while candidate_path not in known_paths:
+            if not candidate_path.endswith(")") or " (" not in candidate_path:
+                raise ValueError(f"RPM verification path is not present in the queried package: {remaining_text}")
+
+            # '/file (error) (replaced)' -> '/file (error)' and 'replaced'.
+            without_closing_parenthesis = candidate_path[:-1]
+            candidate_path, last_message = without_closing_parenthesis.rsplit(" (", maxsplit=1)
+            # Messages are removed from the right; prepend each to keep their original order.
+            messages.insert(0, last_message)
+
+        self.path = candidate_path
+        self.result = result
+        self.flags = flags
+        self.attribute = attribute
+        self.message = "; ".join(messages) or None
+
+
 def scalar(values: t.Iterable) -> str | int:
-    """Return exactly one decoded value."""
+    """Return exactly one decoded value"""
     value, = values
     return value
 
@@ -33,7 +120,7 @@ def _dependency_tags(prefix: str, include_nevrs: bool = True) -> dict:
 
 
 def _script_tags(prefix: str) -> dict:
-    """Describe a script body, its interpreter, and its flags."""
+    """Describe a script body, its interpreter, and its flags"""
     return {
         prefix: scalar,
         f"{prefix}PROG": list,
@@ -42,7 +129,7 @@ def _script_tags(prefix: str) -> dict:
 
 
 def _trigger_tags(prefix: str, priorities: bool = False) -> dict:
-    """Describe the array tags shared by RPM trigger families."""
+    """Describe the array tags shared by RPM trigger families"""
     suffixes = [
         "SCRIPTS", "SCRIPTPROG", "SCRIPTFLAGS", "NAME", "VERSION", "FLAGS", "INDEX",
     ]
@@ -54,7 +141,7 @@ def _trigger_tags(prefix: str, priorities: bool = False) -> dict:
 
 
 class RPMSchema:
-    """Describe public RPM fields and hide the indexes used to interpret them."""
+    """Describe public RPM fields and hide the indexes used to interpret them"""
 
     def __init__(self, sections: t.Mapping) -> None:
         self._sections = sections
@@ -107,11 +194,11 @@ class RPMSchema:
 
         self._verify_fields = sorted(
             (
-                definition
+                definition["verify"]
                 for definition in self._file_tags.values()
                 if "verify" in definition
             ),
-            key=lambda definition: definition["verify"]["position"],
+            key=lambda verification: verification["position"],
         )
 
         self.sections = frozenset(sections)
@@ -122,7 +209,7 @@ class RPMSchema:
             if section.get("default", True)
         )
 
-    def _section_tags(self, categories: t.Iterable[str]) -> t.Set[str]:
+    def _section_tags(self, categories: t.Iterable[str]) -> set[str]:
         categories = set(categories)
         if "all" in categories:
             categories = self.sections
@@ -132,7 +219,7 @@ class RPMSchema:
             for tag in self._sections[category]["tags"]
         }
 
-    def query_format(self, supported_tags: t.Set[str], categories: t.Iterable[str], verify: bool = False) -> str:
+    def query_format(self, supported_tags: set[str], categories: t.Iterable[str], verify: bool = False) -> str:
         missing = self._required - supported_tags
         if missing:
             raise ValueError(f"RPM does not support required tag(s): {', '.join(sorted(missing))}")
@@ -169,7 +256,6 @@ class RPMSchema:
                 continue
             if name in header:
                 raise ValueError(f"RPM returned the tag {name} more than once")
-
             if len(rpm_tag) == 0:
                 raise ValueError(f"RPM returned the tag {name} without a value")
 
@@ -192,8 +278,8 @@ class RPMSchema:
             if key in selected
         }
 
-    def file_records(self, header: t.Mapping) -> t.Dict[str, dict]:
-        """Require complete verification metadata, except fields with schema defaults."""
+    def file_records(self, header: t.Mapping) -> dict[str, RPMFile]:
+        """Index expected file metadata by path, requiring aligned tag arrays"""
         paths = header.get("FILENAMES", [])
         if not paths:
             return {}
@@ -210,35 +296,43 @@ class RPMSchema:
                 raise ValueError(f"RPM file tag {tag} contains {len(values)} entries, expected {len(paths)}")
             arrays[definition["file_field"]] = values
 
-        return {
-            path: {
-                "path": path,
-                **self._file_defaults,
-                **{
-                    field: values[index]
-                    for field, values in arrays.items()
-                },
-            }
-            for index, path in enumerate(paths)
-        }
+        records = {}
+        for index, path in enumerate(paths):
+            metadata = self._file_defaults.copy()
+            metadata.update({
+                field: values[index]
+                for field, values in arrays.items()
+            })
+            records[path] = RPMFile(path=path, **metadata)
+        return records
 
-    def parse_verification_checks(self, result: str) -> t.Tuple[t.Tuple[str, bool, t.Callable], ...]:
-        """Decode status markers into failed fields, error flags, and collectors."""
+    def parse_verification_flags(self, result: str) -> VerificationFailure:
+        """Combine the outcomes in one RPM result into a single flag value"""
+        if result == "missing":
+            return VerificationFailure.MISSING
         if len(result) != len(self._verify_fields):
             raise ValueError(f"Invalid RPM verification result: {result}")
 
-        checks = []
-        for character, definition in zip(result, self._verify_fields):
-            verification = definition["verify"]
-            if character not in (".", "?", verification["marker"]):
+        flags = VerificationFailure.NONE
+        for character, verification in zip(result, self._verify_fields):
+            if character == ".":
+                continue
+            if character not in verification["flags"]:
                 raise ValueError(f"Invalid RPM verification result: {result}")
-            if character != ".":
-                checks.append((definition["file_field"], character == "?", verification["collect"]))
+            flags |= verification["flags"][character]
 
-        return tuple(checks)
+        return flags
 
-    def file_attribute(self, code: str) -> t.Optional[dict]:
-        if code == " ":
+    def unavailable_fields(self, flags: VerificationFailure) -> list[str]:
+        """Return the names of fields checks for which RPM could not perform"""
+        return [
+            definition["file_field"]
+            for definition in self._file_tags.values()
+            if "verify" in definition and flags & definition["verify"]["flags"]["?"]
+        ]
+
+    def file_attribute(self, code: t.Optional[str]) -> t.Optional[dict[str, str]]:
+        if code is None:
             return None
 
         attributes = self._tags["FILEFLAGS"]["attributes"]
@@ -248,7 +342,7 @@ class RPMSchema:
 
         return {"code": code, "name": attributes[code]}
 
-    def digest_algorithm(self, header: t.Mapping) -> t.Tuple[int, t.Optional[str]]:
+    def digest_algorithm(self, header: t.Mapping) -> tuple[int, t.Optional[str]]:
         definition = self._tags["FILEDIGESTALGO"]
         algorithm_id = header.get("FILEDIGESTALGO")
         if algorithm_id is None:
@@ -257,7 +351,7 @@ class RPMSchema:
         return algorithm_id, definition["algorithms"].get(algorithm_id)
 
 
-# tag definitions are the single source for output categories, types and verification
+# tag definitions are the single source of truth for output categories, types and verification
 RPM_SCHEMA = RPMSchema({
     "metadata": {
         "tags": {
@@ -357,8 +451,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_field": "size",
                 "verify": {
                     "position": 0,
-                    "marker": "S",
-                    "collect": lambda module, header, file, file_stat: get_size_failure(file, file_stat),
+                    "flags": {
+                        "S": VerificationFailure.SIZE_MISMATCH,
+                        "?": VerificationFailure.SIZE_UNAVAILABLE,
+                    },
                 },
             },
             "FILESTATES": list,
@@ -367,8 +463,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_field": "mode",
                 "verify": {
                     "position": 1,
-                    "marker": "M",
-                    "collect": lambda module, header, file, file_stat: get_mode_failure(file, file_stat),
+                    "flags": {
+                        "M": VerificationFailure.MODE_MISMATCH,
+                        "?": VerificationFailure.MODE_UNAVAILABLE,
+                    },
                 },
             },
             "FILERDEVS": {
@@ -376,8 +474,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_field": "device",
                 "verify": {
                     "position": 3,
-                    "marker": "D",
-                    "collect": lambda module, header, file, file_stat: get_device_failure(file, file_stat),
+                    "flags": {
+                        "D": VerificationFailure.DEVICE_MISMATCH,
+                        "?": VerificationFailure.DEVICE_UNAVAILABLE,
+                    },
                 },
             },
             "FILEDEVICES": list,
@@ -387,8 +487,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_field": "mtime",
                 "verify": {
                     "position": 7,
-                    "marker": "T",
-                    "collect": lambda module, header, file, file_stat: get_mtime_failure(file, file_stat),
+                    "flags": {
+                        "T": VerificationFailure.MTIME_MISMATCH,
+                        "?": VerificationFailure.MTIME_UNAVAILABLE,
+                    },
                 },
             },
             "FILEDIGESTS": {
@@ -396,8 +498,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_field": "digest",
                 "verify": {
                     "position": 2,
-                    "marker": "5",
-                    "collect": lambda module, header, file, file_stat: get_digest_failure(header, file),
+                    "flags": {
+                        "5": VerificationFailure.DIGEST_MISMATCH,
+                        "?": VerificationFailure.DIGEST_UNAVAILABLE,
+                    },
                 },
             },
             "FILEDIGESTALGO": {
@@ -425,8 +529,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_field": "link_target",
                 "verify": {
                     "position": 4,
-                    "marker": "L",
-                    "collect": lambda module, header, file, file_stat: get_link_failure(file),
+                    "flags": {
+                        "L": VerificationFailure.LINK_TARGET_MISMATCH,
+                        "?": VerificationFailure.LINK_TARGET_UNAVAILABLE,
+                    },
                 },
             },
             "FILEFLAGS": {
@@ -449,8 +555,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_field": "user",
                 "verify": {
                     "position": 5,
-                    "marker": "U",
-                    "collect": lambda module, header, file, file_stat: get_user_failure(file, file_stat),
+                    "flags": {
+                        "U": VerificationFailure.USER_MISMATCH,
+                        "?": VerificationFailure.USER_UNAVAILABLE,
+                    },
                 },
             },
             "FILEGROUPNAME": {
@@ -458,8 +566,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_field": "group",
                 "verify": {
                     "position": 6,
-                    "marker": "G",
-                    "collect": lambda module, header, file, file_stat: get_group_failure(file, file_stat),
+                    "flags": {
+                        "G": VerificationFailure.GROUP_MISMATCH,
+                        "?": VerificationFailure.GROUP_UNAVAILABLE,
+                    },
                 },
             },
             "FILELANGS": list,
@@ -469,8 +579,10 @@ RPM_SCHEMA = RPMSchema({
                 "file_default": "",
                 "verify": {
                     "position": 8,
-                    "marker": "P",
-                    "collect": lambda module, header, file, file_stat: get_capabilities_failure(module, file),
+                    "flags": {
+                        "P": VerificationFailure.CAPABILITIES_MISMATCH,
+                        "?": VerificationFailure.CAPABILITIES_UNAVAILABLE,
+                    },
                 },
             },
             "FILECOLORS": list,
@@ -590,19 +702,16 @@ class RPMCLI:
         except ValueError as exc:
             module.fail_json(msg="Unable to prepare the RPM XML query", error=str(exc))
 
-    def run(self, *arguments: str) -> t.Tuple[int, str, str]:
+    def run(self, *arguments: str) -> tuple[int, str, str]:
         return self.module.run_command(
             [self.executable, *arguments], check_rc=False, environ_update={"LC_ALL": "C"},
         )
 
 
-def _parse_rpm_xml_value(element: ET.Element) -> t.Union[int, str]:
+def _parse_rpm_xml_value(element: ET.Element) -> int | str:
     text = element.text or ""
     if element.tag == "integer":
-        try:
-            return int(text)
-        except ValueError as exc:
-            raise ValueError(f"RPM returned an invalid integer value: {text}") from exc
+        return int(text)
     if element.tag == "string":
         return text
     if element.tag == "base64":
@@ -610,13 +719,14 @@ def _parse_rpm_xml_value(element: ET.Element) -> t.Union[int, str]:
     raise ValueError(f"RPM returned an unsupported XML value type: {element.tag}")
 
 
-def _parse_rpm_xml(xml_output: str) -> t.List[dict]:
-    # query emits one <rpmHeader> per package; add a root for the XML document
+def _parse_rpm_xml(xml_output: str) -> list[dict]:
+    # query emits one <rpmHeader> per package
+    # We add a root for the XML document to effectively parse it
     root = ET.fromstring(f"<rpmQueryResults>{xml_output}</rpmQueryResults>")
     return list(map(RPM_SCHEMA.parse_header, root))
 
 
-def get_rpm_results(rpm_name: str, rpm_cli: RPMCLI) -> t.List[dict]:
+def get_rpm_results(rpm_name: str, rpm_cli: RPMCLI) -> list[dict]:
     """Query installed packages using RPM's native name-selector patterns."""
     # RPMs default selector mixes regex and glob syntax
     arguments = [
@@ -625,7 +735,7 @@ def get_rpm_results(rpm_name: str, rpm_cli: RPMCLI) -> t.List[dict]:
     ]
 
     rc, stdout, stderr = rpm_cli.run(*arguments)
-    # RPM can report selector errors on stderr while returning zero.
+    # RPM can report selector errors on stderr while returning zero
     if rc != 0 or any(line.startswith("error:") for line in stderr.splitlines()):
         rpm_cli.module.fail_json(
             msg="Failed to query installed RPM packages", rpm_name=rpm_name,
@@ -674,14 +784,14 @@ def format_device(device: int) -> dict:
     }
 
 
-def get_username(uid: int) -> t.Union[str, int]:
+def get_username(uid: int) -> str | int:
     try:
         return pwd.getpwuid(uid).pw_name
     except KeyError:
         return uid
 
 
-def get_groupname(gid: int) -> t.Union[str, int]:
+def get_groupname(gid: int) -> str | int:
     try:
         return grp.getgrgid(gid).gr_name
     except KeyError:
@@ -698,74 +808,21 @@ def calculate_file_digest(path: str, algorithm: str) -> str:
     return digest.hexdigest()
 
 
-def get_size_failure(rpm_file: t.Mapping, file_stat: os.stat_result) -> dict:
-    return {
-        "expected": rpm_file["size"],
-        "actual": file_stat.st_size,
-    }
-
-
-def get_mode_failure(rpm_file: t.Mapping, file_stat: os.stat_result) -> dict:
+def get_link_failure(rpm_file: RPMFile) -> dict:
     failure = {
-        "expected": format_file_mode(rpm_file["mode"]),
-        "actual": format_file_mode(file_stat.st_mode),
-    }
-
-    if failure["expected"] == failure["actual"]:
-        failure["note"] = (
-            "RPM mode verification can also detect non-default ACLs"
-        )
-
-    return failure
-
-
-def get_user_failure(rpm_file: t.Mapping, file_stat: os.stat_result) -> dict:
-    return {
-        "expected": rpm_file["user"],
-        "actual": get_username(file_stat.st_uid),
-        "actual_uid": file_stat.st_uid,
-    }
-
-
-def get_group_failure(rpm_file: t.Mapping, file_stat: os.stat_result) -> dict:
-    return {
-        "expected": rpm_file["group"],
-        "actual": get_groupname(file_stat.st_gid),
-        "actual_gid": file_stat.st_gid,
-    }
-
-
-def get_mtime_failure(rpm_file: t.Mapping, file_stat: os.stat_result) -> dict:
-    return {
-        "expected": format_timestamp(rpm_file["mtime"]),
-        "actual": format_timestamp(int(file_stat.st_mtime)),
-    }
-
-
-def get_device_failure(rpm_file: t.Mapping, file_stat: os.stat_result) -> dict:
-    return {
-        "expected": format_device(rpm_file["device"]),
-        "actual": format_device(file_stat.st_rdev),
-    }
-
-
-def get_link_failure(rpm_file: t.Mapping) -> dict:
-    path = rpm_file["path"]
-
-    failure = {
-        "expected": rpm_file["link_target"],
+        "expected": rpm_file.link_target,
         "actual": None,
     }
 
     try:
-        failure["actual"] = os.readlink(path)
+        failure["actual"] = os.readlink(rpm_file.path)
     except OSError as exc:
         failure["error"] = str(exc)
 
     return failure
 
 
-def get_digest_failure(rpm_header: t.Mapping, rpm_file: t.Mapping) -> dict:
+def get_digest_failure(rpm_header: t.Mapping, rpm_file: RPMFile) -> dict:
     algorithm_id, algorithm = RPM_SCHEMA.digest_algorithm(rpm_header)
 
     failure = {
@@ -773,7 +830,7 @@ def get_digest_failure(rpm_header: t.Mapping, rpm_file: t.Mapping) -> dict:
             "id": algorithm_id,
             "name": algorithm,
         },
-        "expected": rpm_file["digest"],
+        "expected": rpm_file.digest,
         "actual": None,
     }
 
@@ -783,7 +840,7 @@ def get_digest_failure(rpm_header: t.Mapping, rpm_file: t.Mapping) -> dict:
 
     try:
         failure["actual"] = calculate_file_digest(
-            rpm_file["path"],
+            rpm_file.path,
             algorithm,
         )
     except (OSError, ValueError) as exc:
@@ -792,41 +849,35 @@ def get_digest_failure(rpm_header: t.Mapping, rpm_file: t.Mapping) -> dict:
     return failure
 
 
-def get_actual_capabilities(module: AnsibleModule, path: str) -> t.Tuple[t.Optional[str], t.Optional[str]]:
+def get_capabilities_failure(module: AnsibleModule, rpm_file: RPMFile) -> dict:
+    failure = {
+        "expected": rpm_file.capabilities,
+        "actual": None,
+    }
+
     getcap = module.get_bin_path("getcap")
     if getcap is None:
-        return None, "getcap is not available"
+        failure["error"] = "getcap is not available"
+        return failure
 
-    rc, stdout, stderr = module.run_command([getcap, "-n", path])
+    rc, stdout, stderr = module.run_command([getcap, "-n", rpm_file.path])
     # getcap can report a per-file error on stderr and still exit successfully
     if rc != 0 or stderr.strip():
-        return None, stderr.strip() or "getcap failed"
+        failure["error"] = stderr.strip() or "getcap failed"
+        return failure
     if not stdout.strip():
-        return "", None
+        failure["actual"] = ""
+        return failure
 
     # the filename itself may contain spaces.
     # remove its exact prefix first.
-    prefix = f"{path} "
+    prefix = f"{rpm_file.path} "
     if stdout.startswith(prefix):
-        return stdout[len(prefix):].strip(), None
-    if stdout.rstrip("\n") == path:
-        return "", None
-    return None, "Unrecognized getcap output"
-
-
-def get_capabilities_failure(module: AnsibleModule, rpm_file: t.Mapping) -> dict:
-    actual, error = get_actual_capabilities(
-        module,
-        rpm_file["path"],
-    )
-
-    failure = {
-        "expected": rpm_file["capabilities"],
-        "actual": actual,
-    }
-
-    if error is not None:
-        failure["error"] = error
+        failure["actual"] = stdout[len(prefix):].strip()
+    elif stdout.rstrip("\n") == rpm_file.path:
+        failure["actual"] = ""
+    else:
+        failure["error"] = "Unrecognized getcap output"
 
     return failure
 
@@ -853,124 +904,126 @@ def get_exists_failure(path: str) -> dict:
     }
 
 
-def _parse_rpm_verify_line(line: str, rpm_files: t.Mapping[str, dict]) -> t.Optional[dict]:
-    # installed-package paths are absolute.
-    # we want to split only the prefix so any kind of spaces or trailing whitespace in the filename are unchanged.
-    prefix, separator, path = line.partition(" /")
-    fields = prefix.split()
-    if not separator or len(fields) not in (1, 2):
-        raise ValueError(f"Unrecognized RPM verification record: {line}")
-
-    result = fields[0]
-    missing = result == "missing"
-    checks = () if missing else RPM_SCHEMA.parse_verification_checks(result)
-    attribute = RPM_SCHEMA.file_attribute(fields[1] if len(fields) == 2 else " ")
-    rpm_file, message = _resolve_rpm_verify_file("/" + path, rpm_files)
-    if not missing and not checks:
-        return None  # RPM also reports state-only records, such as "(replaced)"
-
-    return {
-        "file": rpm_file,
-        "result": result,
-        "missing": missing,
-        "checks": checks,
-        "attribute": attribute,
-        "message": message,
-    }
-
-
-def _resolve_rpm_verify_file(reported_path: str, rpm_files: t.Mapping[str, dict]) -> t.Tuple[dict, t.Optional[str]]:
-    # match the full filename first, then remove any of RPMs trailing errors and/or
-    # state messages until a known path remains.
-    #
-    # both error and state messages can occur together.
-    path = reported_path
-    messages = []
-    while path not in rpm_files:
-        candidate, separator, suffix = path.rpartition(" (")
-
-        if not separator or not suffix.endswith(")"):
-            raise ValueError(f"RPM verification path is not present in the queried package: {reported_path}")
-
-        messages.append(suffix[:-1])
-        path = candidate
-
-    return rpm_files[path], "; ".join(reversed(messages)) or None
-
-
-def get_verify_failures(module: AnsibleModule, rpm_header: t.Mapping, record: t.Mapping) -> dict:
-    """Collect current values for the failed checks in a parsed record."""
-    rpm_file = record["file"]
-    if record["missing"]:
-        return {
-            "exists": get_exists_failure(rpm_file["path"])
-        }
-
-    try:
-        file_stat = os.lstat(rpm_file["path"])
-    except OSError as exc:
-        return {
-            "exists": {
-                "expected": True,
-                "actual": None,
-                "error": str(exc),
-            }
-        }
-
-    failures = {}
-    for field, unknown, collect in record["checks"]:
-        failure = collect(module, rpm_header, rpm_file, file_stat)
-        if unknown:
-            failure.setdefault("error", "RPM could not perform this verification test")
-        failures[field] = failure
-    return failures
-
-
-def collect_verification(module: AnsibleModule, rpm_header: t.Mapping, record: t.Mapping) -> dict:
-    """Build the public verification result from a parsed record."""
-    result = {
-        "path": record["file"]["path"],
-        "result": record["result"],
-        "failures": get_verify_failures(module, rpm_header, record),
-    }
-    if record["attribute"] is not None:
-        result["attribute"] = record["attribute"]
-    if record["message"] is not None:
-        result["message"] = record["message"]
-    return result
-
-
 def verify_rpm(rpm_cli: RPMCLI, rpm_header: t.Mapping) -> dict:
-    """Verify installed files, excluding dependencies, scripts, and header checks."""
+    # The logic to get the verifiction information is complicated.
+    #
+    # To increase readability, this function is long
+    # for the purpose of reducing indirection,
+    # and thus increasing the overall readability and clarity.
     package = rpm_header.get("NVRA", rpm_header["NVR"])
     arguments = [
-        "--verify", "--nodeps", "--noscripts",
+        "--verify",
+        "--nodeps",
+        "--noscripts",
         # skip unnessessary header checks.
         # per-file digest verification remains enabled.
-        "--nodigest", "--nosignature", package,
+        "--nodigest",
+        "--nosignature",
+        package,
     ]
     rc, stdout, stderr = rpm_cli.run(*arguments)
+
     diagnostics = {
-        "package": package, "command": [rpm_cli.executable, *arguments],
-        "rc": rc, "stdout": stdout, "stderr": stderr.strip(),
+        "package": package,
+        "command": [rpm_cli.executable, *arguments],
+        "rc": rc,
+        "stdout": stdout,
+        "stderr": stderr.strip(),
     }
+
     try:
         rpm_files = RPM_SCHEMA.file_records(rpm_header)
-        parse_record = partial(_parse_rpm_verify_line, rpm_files=rpm_files)
-        records = map(parse_record, filter(None, stdout.splitlines()))
-        parsed_records = list(filter(None, records))
+        nonempty_lines = filter(None, stdout.splitlines())
+        parse_record = partial(VerificationRecord, known_paths=rpm_files.keys())
+        records = map(parse_record, nonempty_lines)
+        # RPM also reports state-only records, such as "(replaced)"
+        failed_records = [record for record in records if record.flags]
     except (TypeError, ValueError) as exc:
         rpm_cli.module.fail_json(msg="Failed to interpret RPM verification output", error=str(exc), **diagnostics)
 
     # nonzero with differences is normal, without differences it is a command failure
-    if rc != 0 and not parsed_records:
+    if rc != 0 and not failed_records:
         rpm_cli.module.fail_json(msg="Failed to verify installed RPM package", **diagnostics)
 
-    collect_record = partial(collect_verification, rpm_cli.module, rpm_header)
-    failed_files = list(map(collect_record, parsed_records))
-    passed_result = rc == 0 and not failed_files
+    unavailable_error = "RPM could not perform this verification test"
+    failed_files = []
+    for record in failed_records:
+        flags = record.flags
+        failures: dict[str, dict[str, str | int | dict | None]] = {}
+        file_result = {
+            "path": record.path,
+            "result": record.result,
+            "failures": failures
+        }
+
+        if record.attribute is not None:
+            file_result["attribute"] = record.attribute
+        if record.message is not None:
+            file_result["message"] = record.message
+        failed_files.append(file_result)
+
+        if flags & VerificationFailure.MISSING:
+            failures["exists"] = get_exists_failure(record.path)
+            continue
+
+        try:
+            actual = os.lstat(record.path)
+        except OSError as exc:
+            failures["exists"] = {"expected": True, "actual": None, "error": str(exc)}
+            continue
+
+        expected = rpm_files[record.path]
+        if flags & (VerificationFailure.SIZE_MISMATCH | VerificationFailure.SIZE_UNAVAILABLE):
+            failures["size"] = {"expected": expected.size, "actual": actual.st_size}
+
+        if flags & (VerificationFailure.MODE_MISMATCH | VerificationFailure.MODE_UNAVAILABLE):
+            failures["mode"] = {
+                "expected": format_file_mode(expected.mode),
+                "actual": format_file_mode(actual.st_mode),
+            }
+            if failures["mode"]["expected"] == failures["mode"]["actual"]:
+                failures["mode"]["note"] = "RPM mode verification can also detect non-default ACLs"
+
+        if flags & (VerificationFailure.DIGEST_MISMATCH | VerificationFailure.DIGEST_UNAVAILABLE):
+            failures["digest"] = get_digest_failure(rpm_header, expected)
+
+        if flags & (VerificationFailure.DEVICE_MISMATCH | VerificationFailure.DEVICE_UNAVAILABLE):
+            failures["device"] = {
+                "expected": format_device(expected.device),
+                "actual": format_device(actual.st_rdev),
+            }
+
+        if flags & (VerificationFailure.LINK_TARGET_MISMATCH | VerificationFailure.LINK_TARGET_UNAVAILABLE):
+            failures["link_target"] = get_link_failure(expected)
+
+        if flags & (VerificationFailure.USER_MISMATCH | VerificationFailure.USER_UNAVAILABLE):
+            failures["user"] = {
+                "expected": expected.user,
+                "actual": get_username(actual.st_uid),
+                "actual_uid": actual.st_uid,
+            }
+
+        if flags & (VerificationFailure.GROUP_MISMATCH | VerificationFailure.GROUP_UNAVAILABLE):
+            failures["group"] = {
+                "expected": expected.group,
+                "actual": get_groupname(actual.st_gid),
+                "actual_gid": actual.st_gid,
+            }
+
+        if flags & (VerificationFailure.MTIME_MISMATCH | VerificationFailure.MTIME_UNAVAILABLE):
+            failures["mtime"] = {
+                "expected": format_timestamp(expected.mtime),
+                "actual": format_timestamp(int(actual.st_mtime)),
+            }
+
+        if flags & (VerificationFailure.CAPABILITIES_MISMATCH | VerificationFailure.CAPABILITIES_UNAVAILABLE):
+            failures["capabilities"] = get_capabilities_failure(rpm_cli.module, expected)
+
+        for field in RPM_SCHEMA.unavailable_fields(flags):
+            failures[field].setdefault("error", unavailable_error)
+
     verification = {
-        "passed": passed_result,
+        "passed": rc == 0 and not failed_files,
         "files": failed_files
     }
 

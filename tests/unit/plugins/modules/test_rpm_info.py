@@ -59,7 +59,7 @@ def run_module(mocker, capfd):
         commands = mocker.patch.object(AnsibleModule, "run_command", side_effect=command)
         with set_module_args(dict(params)), pytest.raises(SystemExit) as exc:
             rpm_info.main()
-        stdout, _ = capfd.readouterr()
+        stdout = capfd.readouterr()[0]
         result = json.loads(stdout)
         assert exc.value.code == 0, result
         assert not result["changed"]
@@ -74,7 +74,7 @@ def run_module(mocker, capfd):
     [[], ["files"], ["changelog"], ["metadata"], ["all"]],
 )
 def test_selected_sections_return_the_requested_fields(run_module, include):
-    result, _ = run_module({"name": ["sample"], "include": include}, {"name=sample": [package()]})
+    result = run_module({"name": ["sample"], "include": include}, {"name=sample": [package()]})[0]
     assert len(result) == 1
     assert result[0]["name"] == "sample"
     assert ("version" in result[0]) is bool(set(include) & {"metadata", "all"})
@@ -92,7 +92,7 @@ def test_sorting_and_deduplication_use_full_identity_before_filtering(run_module
         package(epoch=1),
     ]
     matches = {"name=s*": list(reversed(ordered)), "name=sample": ordered[1:]}
-    result, _ = run_module({"name": ["s*", "sample"], "include": ["dependencies"]}, matches)
+    result = run_module({"name": ["s*", "sample"], "include": ["dependencies"]}, matches)[0]
     assert result == [{"name": p["NAME"], "providename": p["PROVIDENAME"]} for p in ordered]
 
 
@@ -114,5 +114,5 @@ def test_verification_runs_once_for_overlapping_selectors(run_module):
 
 
 def test_no_matching_packages_returns_an_empty_list(run_module):
-    result, _ = run_module({"name": ["not-installed"]}, {"name=not-installed": []})
+    result = run_module({"name": ["not-installed"]}, {"name=not-installed": []})[0]
     assert result == []

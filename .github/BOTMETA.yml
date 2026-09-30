@@ -435,6 +435,8 @@ files:
   $module_utils/_redfish_utils.py:
     labels: redfish_utils
     maintainers: $team_redfish
+  $module_utils/_rpm_info.py:
+    maintainers: NicholasBrodersen
   $module_utils/_scaleway.py:
     labels: cloud scaleway
     maintainers: $team_scaleway
@@ -1257,6 +1259,8 @@ files:
     maintainers: Deepakkothandan
   $modules/rollbar_deployment.py:
     maintainers: kavu
+  $modules/rpm_info.py:
+    maintainers: NicholasBrodersen
   $modules/rpm_ostree_pkg.py:
     maintainers: dustymabe Akasurde
   $modules/rundeck_acl_policy.py:
